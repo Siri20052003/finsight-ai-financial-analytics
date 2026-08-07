@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 import json
 
@@ -77,16 +78,17 @@ def build_modeling_dataset(invoices, customers, as_of_date=None):
     else:
         as_of_date = pd.Timestamp(as_of_date).normalize()
 
+    maturity_delta = timedelta(days=int(MIN_MATURITY_DAYS))
     # Only use invoices that have had at least 30 days after the contractual due
     # date to reveal whether they became seriously late. This avoids labeling
     # very recent invoices as "good" before their outcome is observable.
-    maturity_cutoff = as_of_date - pd.Timedelta(days=MIN_MATURITY_DAYS)
+    maturity_cutoff = as_of_date - maturity_delta
     df = df[df["due_date"] <= maturity_cutoff].copy()
     df = df[df["net_amount_due"] > 0.01].copy()
 
     late_paid = (
         df["last_payment_date"].notna()
-        & (df["last_payment_date"] > df["due_date"] + pd.Timedelta(days=MIN_MATURITY_DAYS))
+        & (df["last_payment_date"] > df["due_date"] + maturity_delta)
     )
     still_open_late = df["positive_outstanding_amount"] > 0.01
     df[TARGET] = (late_paid | still_open_late).astype(int)
