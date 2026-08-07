@@ -1,0 +1,108 @@
+// FinSight AI core Power BI measures
+
+Total Invoice Value =
+SUM ( fact_invoice[invoice_amount] )
+
+Total Collections =
+SUM ( fact_invoice[paid_amount] )
+
+Gross Outstanding AR =
+SUM ( fact_invoice[positive_outstanding_amount] )
+
+Overdue AR =
+CALCULATE (
+    [Gross Outstanding AR],
+    fact_invoice[is_overdue] = TRUE ()
+)
+
+Overdue AR % =
+DIVIDE ( [Overdue AR], [Gross Outstanding AR] )
+
+Open Invoice Count =
+CALCULATE (
+    COUNTROWS ( fact_invoice ),
+    fact_invoice[positive_outstanding_amount] > 0.01
+)
+
+Overdue Invoice Count =
+CALCULATE (
+    COUNTROWS ( fact_invoice ),
+    fact_invoice[is_overdue] = TRUE ()
+)
+
+Total Expense =
+SUM ( fact_expense[amount] )
+
+Review Queue Count =
+CALCULATE (
+    COUNTROWS ( fact_expense ),
+    fact_expense[review_flag] = TRUE ()
+)
+
+Review Queue Value =
+CALCULATE (
+    [Total Expense],
+    fact_expense[review_flag] = TRUE ()
+)
+
+Review Queue % of Spend =
+DIVIDE ( [Review Queue Value], [Total Expense] )
+
+Budget Amount =
+SUM ( fact_budget[budget_amount] )
+
+Budget Actual =
+SUM ( fact_budget[actual_expense] )
+
+Budget Variance =
+[Budget Actual] - [Budget Amount]
+
+Budget Variance % =
+DIVIDE ( [Budget Variance], [Budget Amount] )
+
+Over-Budget Department-Months =
+CALCULATE (
+    COUNTROWS ( fact_budget ),
+    fact_budget[budget_status] = "OVER_BUDGET"
+)
+
+Priority Collection Invoice Count =
+CALCULATE (
+    COUNTROWS ( fact_collection_risk ),
+    fact_collection_risk[collection_priority] = "PRIORITY_REVIEW"
+)
+
+Average Risk Probability =
+AVERAGE ( fact_collection_risk[selected_risk_probability] )
+
+Priority Review Invoice Value =
+CALCULATE (
+    SUM ( fact_collection_risk[invoice_amount] ),
+    fact_collection_risk[collection_priority] = "PRIORITY_REVIEW"
+)
+
+Forecast Collections =
+SUM ( fact_cash_forecast[forecast_collections] )
+
+Forecast Expenses =
+SUM ( fact_cash_forecast[forecast_expenses] )
+
+Forecast Net Cash Flow =
+SUM ( fact_cash_forecast[forecast_net_cash_flow] )
+
+Cumulative Forecast Net Cash Flow =
+VAR CurrentWeek = MAX ( fact_cash_forecast[week] )
+RETURN
+    CALCULATE (
+        [Forecast Net Cash Flow],
+        FILTER (
+            ALLSELECTED ( fact_cash_forecast[week] ),
+            fact_cash_forecast[week] <= CurrentWeek
+        )
+    )
+
+Due-Date Outstanding AR =
+CALCULATE (
+    [Gross Outstanding AR],
+    USERELATIONSHIP ( dim_date[date], fact_invoice[due_date] )
+)
