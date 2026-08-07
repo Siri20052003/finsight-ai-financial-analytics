@@ -60,6 +60,8 @@ def load_inputs(processed_dir=PROCESSED_DIR):
 
 def build_modeling_dataset(invoices, customers, as_of_date=None):
     df = invoices.copy()
+    # payment_terms_days already belongs to the trusted invoice analytics layer,
+    # so do not re-merge it from the customer table and create duplicate columns.
     customer_cols = [
         "customer_id",
         "signup_date",
@@ -67,7 +69,6 @@ def build_modeling_dataset(invoices, customers, as_of_date=None):
         "region",
         "customer_size",
         "credit_rating",
-        "payment_terms_days",
     ]
     df = df.merge(customers[customer_cols], on="customer_id", how="left", validate="many_to_one")
 
@@ -101,10 +102,8 @@ def build_modeling_dataset(invoices, customers, as_of_date=None):
     df["prior_late_rate"] = np.where(
         df["prior_invoice_count"] > 0,
         prior_late_sum / df["prior_invoice_count"],
-        np.nan,
+        0.0,
     )
-    global_rate = float(df[TARGET].mean()) if len(df) else 0.0
-    df["prior_late_rate"] = df["prior_late_rate"].fillna(global_rate)
 
     # Keep only modeling-safe fields plus identifiers useful for audit/prediction export.
     keep = ["invoice_id", "customer_id", "invoice_date", TARGET] + FEATURES
@@ -115,10 +114,15 @@ def chronological_split(df, train_fraction=0.80):
     if df.empty:
         raise ValueError("Modeling dataset is empty.")
     ordered = df.sort_values(["invoice_date", "invoice_id"]).reset_index(drop=True)
-    split_idx = int(len(ordered) * train_fraction)
-    split_idx = min(max(split_idx, 1), len(ordered) - 1)
-    train = ordered.iloc[:split_idx].copy()
-    test = ordered.iloc[split_idx:].copy()
+    unique_dates = pd.Series(pd.to_datetime(ordered["invoice_date"]).dt.normalize().unique()).sort_values().reset_index(drop=True)
+    if len(unique_dates) < 2:
+        raise ValueError("Need at least two distinct invoice dates for a chronological split.")
+    cutoff_idx = min(max(int(len(unique_dates) * train_fraction) - 1, 0), len(unique_dates) - 2)
+    cutoff_date = pd.Timestamp(unique_dates.iloc[cutoff_idx])
+    train = ordered[pd.to_datetime(ordered["invoice_date"]).dt.normalize() <= cutoff_date].copy()
+    test = ordered[pd.to_datetime(ordered["invoice_date"]).dt.normalize() > cutoff_date].copy()
+    if train.empty or test.empty:
+        raise ValueError("Chronological split produced an empty train or test set.")
     return train, test
 
 
@@ -227,6 +231,8 @@ def save_artifacts(modeling_df, train, test, fitted, probabilities, results, bes
         "modeling_rows": int(len(modeling_df)),
         "train_rows": int(len(train)),
         "test_rows": int(len(test)),
+        "train_date_max": pd.Timestamp(train["invoice_date"].max()).strftime("%Y-%m-%d"),
+        "test_date_min": pd.Timestamp(test["invoice_date"].min()).strftime("%Y-%m-%d"),
         "train_late_rate": round(float(train[TARGET].mean()), 4),
         "test_late_rate": round(float(test[TARGET].mean()), 4),
         "selected_model": best_name,
@@ -256,6 +262,8 @@ def main():
     print(f"Modeling rows              : {metrics['modeling_rows']:,}")
     print(f"Train rows                 : {metrics['train_rows']:,}")
     print(f"Test rows                  : {metrics['test_rows']:,}")
+    print(f"Train through              : {metrics['train_date_max']}")
+    print(f"Test starts                : {metrics['test_date_min']}")
     print(f"Train late-payment rate    : {metrics['train_late_rate']:.2%}")
     print(f"Test late-payment rate     : {metrics['test_late_rate']:.2%}")
     print()
