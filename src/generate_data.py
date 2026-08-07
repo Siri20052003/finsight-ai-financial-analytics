@@ -52,7 +52,8 @@ def build_invoices(cfg, customers, rng):
         "tax_amount": tax,
         "invoice_amount": subtotal + tax,
     })
-    # Inject realistic quality defects.
+
+    # Intentional source-system defects for the data-quality workflow.
     missing_idx = rng.choice(df.index, size=max(1, int(n * 0.005)), replace=False)
     df.loc[missing_idx, "customer_id"] = None
     invalid_idx = rng.choice(df.index.difference(missing_idx), size=max(1, int(n * 0.003)), replace=False)
@@ -61,14 +62,43 @@ def build_invoices(cfg, customers, rng):
     return pd.concat([df, dupes], ignore_index=True)
 
 
-def build_payments(invoices, rng):
+def _payment_outcome_probabilities(days_past_due_at_cutoff):
+    """Return realistic payment-state probabilities at the reporting cutoff.
+
+    Older invoices are much more likely to have settled. Recent and not-yet-due
+    invoices are more likely to remain open, which prevents an unrealistic AR
+    portfolio dominated by very old unpaid invoices.
+    """
+    if days_past_due_at_cutoff > 90:
+        return [0.88, 0.07, 0.03, 0.02]  # full, partial, over, unpaid
+    if days_past_due_at_cutoff > 30:
+        return [0.76, 0.14, 0.04, 0.06]
+    if days_past_due_at_cutoff >= 0:
+        return [0.55, 0.20, 0.03, 0.22]
+    return [0.25, 0.15, 0.02, 0.58]
+
+
+def build_payments(cfg, invoices, rng):
     valid = invoices.drop_duplicates("invoice_id").dropna(subset=["customer_id"]).copy()
+    cutoff = pd.Timestamp(cfg.end_date).normalize()
     records = []
     payment_counter = 1
+
     for row in valid.itertuples(index=False):
-        outcome = rng.choice(["full", "partial", "over", "unpaid"], p=[0.72, 0.14, 0.04, 0.10])
+        invoice_date = pd.Timestamp(row.invoice_date).normalize()
+        due_date = pd.Timestamp(row.due_date).normalize()
+        # Invalid due dates are source defects. Use a temporary operational due date
+        # for simulation; the curated layer later repairs the source field explicitly.
+        effective_due = due_date if due_date >= invoice_date else invoice_date + pd.Timedelta(days=30)
+        days_past_due_at_cutoff = int((cutoff - effective_due).days)
+
+        outcome = rng.choice(
+            ["full", "partial", "over", "unpaid"],
+            p=_payment_outcome_probabilities(days_past_due_at_cutoff),
+        )
         if outcome == "unpaid":
             continue
+
         total = float(row.invoice_amount)
         pieces = [total]
         if outcome == "partial":
@@ -78,18 +108,31 @@ def build_payments(invoices, rng):
                 pieces.append(round(total - first, 2))
         elif outcome == "over":
             pieces = [round(total * rng.uniform(1.01, 1.08), 2)]
-        base_date = pd.Timestamp(row.due_date) + pd.to_timedelta(int(rng.normal(4, 22)), unit="D")
+
+        # Payment timing centers around the contractual due date. Never create
+        # payments before the invoice date or after the dataset reporting cutoff.
+        base_date = effective_due + pd.to_timedelta(int(rng.normal(4, 18)), unit="D")
+        base_date = max(base_date, invoice_date)
+
         for j, amount in enumerate(pieces):
+            payment_date = base_date + pd.to_timedelta(j * 7, unit="D")
+            if payment_date > cutoff:
+                continue
             records.append({
                 "payment_id": f"PAY_{payment_counter:08d}",
                 "invoice_id": row.invoice_id,
                 "customer_id": row.customer_id,
-                "payment_date": base_date + pd.to_timedelta(j * 7, unit="D"),
+                "payment_date": payment_date,
                 "payment_amount": amount,
                 "payment_method": rng.choice(["ACH", "Wire", "Card", "Check"], p=[0.50, 0.20, 0.20, 0.10]),
             })
             payment_counter += 1
+
     payments = pd.DataFrame(records)
+    if payments.empty:
+        return payments
+
+    # Intentional unapplied cash: payment rows whose invoice reference does not exist.
     orphan_n = max(1, int(len(payments) * 0.002))
     orphans = payments.sample(orphan_n, random_state=7).copy()
     orphans["payment_id"] = [f"PAY_ORPHAN_{i:05d}" for i in range(1, orphan_n + 1)]
@@ -112,21 +155,54 @@ def build_expenses(cfg, rng):
     })
 
 
-def build_budgets(cfg, rng):
+def build_budgets(cfg, expenses, rng):
+    """Create department-month budgets around expected monthly spend.
+
+    The first version used arbitrary $120K-$650K budgets, which made every small
+    test month appear under budget. Here we simulate planning error around actual
+    monthly spend so the portfolio contains a realistic mix of favorable and
+    unfavorable variances. This is synthetic calibration, not historical leakage.
+    """
     months = pd.date_range(pd.Timestamp(cfg.start_date).replace(day=1), pd.Timestamp(cfg.end_date), freq="MS")
+    monthly = (
+        expenses.assign(month=expenses["expense_date"].dt.to_period("M").dt.to_timestamp())
+        .groupby(["department", "month"], as_index=False)
+        .agg(actual_expense=("amount", "sum"))
+    )
+    actual_lookup = monthly.set_index(["department", "month"])["actual_expense"].to_dict()
+    dept_typical = monthly.groupby("department")["actual_expense"].median().to_dict()
+
     rows = []
     for month in months:
         for dept in DEPARTMENTS:
-            rows.append({"department": dept, "month": month, "budget_amount": round(rng.uniform(120_000, 650_000), 2)})
+            baseline = float(actual_lookup.get((dept, month), dept_typical.get(dept, 50_000.0)))
+            # Roughly 30% of department-months are intentionally planned tightly
+            # enough to end over budget; the remainder retain a modest cushion.
+            if rng.random() < 0.30:
+                planning_factor = rng.uniform(0.82, 0.98)
+            else:
+                planning_factor = rng.uniform(1.02, 1.22)
+            rows.append({
+                "department": dept,
+                "month": month,
+                "budget_amount": round(max(1_000.0, baseline * planning_factor), 2),
+            })
     return pd.DataFrame(rows)
 
 
-def build_adjustments(invoices, rng):
+def build_adjustments(cfg, invoices, rng):
     unique = invoices.drop_duplicates("invoice_id")
     n = max(1, int(len(unique) * 0.05))
     sampled = unique.sample(n=n, random_state=11)
+    cutoff = pd.Timestamp(cfg.end_date).normalize()
     rows = []
+
     for i, row in enumerate(sampled.itertuples(index=False), 1):
+        invoice_date = pd.Timestamp(row.invoice_date).normalize()
+        remaining_days = int((cutoff - invoice_date).days)
+        if remaining_days < 1:
+            continue
+        delay = int(rng.integers(1, min(120, remaining_days) + 1))
         kind = rng.choice(ADJUSTMENT_TYPES, p=[0.45, 0.20, 0.20, 0.15])
         amount = round(float(row.invoice_amount) * rng.uniform(0.02, 0.35), 2)
         if kind in {"credit", "refund", "write_off"}:
@@ -134,7 +210,7 @@ def build_adjustments(invoices, rng):
         rows.append({
             "adjustment_id": f"ADJ_{i:06d}",
             "invoice_id": row.invoice_id,
-            "adjustment_date": pd.Timestamp(row.invoice_date) + pd.to_timedelta(int(rng.integers(1, 120)), unit="D"),
+            "adjustment_date": invoice_date + pd.to_timedelta(delay, unit="D"),
             "adjustment_type": kind,
             "adjustment_amount": amount,
             "reason": rng.choice(["Pricing correction", "Service credit", "Dispute", "Duplicate charge", "Collection decision"]),
@@ -146,11 +222,18 @@ def generate_all(cfg):
     rng = np.random.default_rng(cfg.seed)
     customers = build_customers(cfg, rng)
     invoices = build_invoices(cfg, customers, rng)
-    payments = build_payments(invoices, rng)
+    payments = build_payments(cfg, invoices, rng)
     expenses = build_expenses(cfg, rng)
-    budgets = build_budgets(cfg, rng)
-    adjustments = build_adjustments(invoices, rng)
-    return {"customers": customers, "invoices": invoices, "payments": payments, "expenses": expenses, "budgets": budgets, "adjustments": adjustments}
+    budgets = build_budgets(cfg, expenses, rng)
+    adjustments = build_adjustments(cfg, invoices, rng)
+    return {
+        "customers": customers,
+        "invoices": invoices,
+        "payments": payments,
+        "expenses": expenses,
+        "budgets": budgets,
+        "adjustments": adjustments,
+    }
 
 
 def save_all(data, output_dir):
@@ -173,5 +256,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = GenerationConfig(seed=args.seed, n_customers=args.customers, n_invoices=args.invoices, n_expenses=args.expenses, output_dir=Path(args.output))
+    cfg = GenerationConfig(
+        seed=args.seed,
+        n_customers=args.customers,
+        n_invoices=args.invoices,
+        n_expenses=args.expenses,
+        output_dir=Path(args.output),
+    )
     save_all(generate_all(cfg), cfg.output_dir)
