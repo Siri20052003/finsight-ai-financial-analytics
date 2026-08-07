@@ -1,4 +1,5 @@
 import argparse
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -118,7 +119,7 @@ def build_payments(cfg, invoices, customers, rng):
     for row in valid.itertuples(index=False):
         invoice_date = pd.Timestamp(row.invoice_date).normalize()
         due_date = pd.Timestamp(row.due_date).normalize()
-        effective_due = due_date if due_date >= invoice_date else invoice_date + pd.Timedelta(days=int(row.payment_terms_days))
+        effective_due = due_date if due_date >= invoice_date else invoice_date + timedelta(days=int(row.payment_terms_days))
         days_past_due_at_cutoff = int((cutoff - effective_due).days)
         risk_score = _customer_payment_risk(row)
 
