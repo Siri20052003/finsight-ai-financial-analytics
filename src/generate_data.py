@@ -62,24 +62,55 @@ def build_invoices(cfg, customers, rng):
     return pd.concat([df, dupes], ignore_index=True)
 
 
-def _payment_outcome_probabilities(days_past_due_at_cutoff):
-    """Return realistic payment-state probabilities at the reporting cutoff.
+def _payment_outcome_probabilities(days_past_due_at_cutoff, risk_score):
+    """Return payment-state probabilities at the reporting cutoff.
 
-    Older invoices are much more likely to have settled. Recent and not-yet-due
-    invoices are more likely to remain open, which prevents an unrealistic AR
-    portfolio dominated by very old unpaid invoices.
+    Calendar age determines how much time an invoice has had to settle, while the
+    customer risk score modestly changes the chance of remaining partial/unpaid.
+    The risk relationship is intentionally noisy so the later ML task is useful
+    without becoming trivially predictable.
     """
     if days_past_due_at_cutoff > 90:
-        return [0.88, 0.07, 0.03, 0.02]  # full, partial, over, unpaid
-    if days_past_due_at_cutoff > 30:
-        return [0.76, 0.14, 0.04, 0.06]
-    if days_past_due_at_cutoff >= 0:
-        return [0.55, 0.20, 0.03, 0.22]
-    return [0.25, 0.15, 0.02, 0.58]
+        base = np.array([0.88, 0.07, 0.03, 0.02], dtype=float)
+    elif days_past_due_at_cutoff > 30:
+        base = np.array([0.76, 0.14, 0.04, 0.06], dtype=float)
+    elif days_past_due_at_cutoff >= 0:
+        base = np.array([0.55, 0.20, 0.03, 0.22], dtype=float)
+    else:
+        base = np.array([0.25, 0.15, 0.02, 0.58], dtype=float)
+
+    shift = 0.12 * (risk_score - 0.35)
+    base[0] -= shift
+    base[1] += shift * 0.35
+    base[3] += shift * 0.65
+    base = np.clip(base, 0.01, None)
+    return (base / base.sum()).tolist()
 
 
-def build_payments(cfg, invoices, rng):
+def _customer_payment_risk(row):
+    """Create an unobserved synthetic payment-risk propensity from business traits."""
+    credit_component = {"A": 0.10, "B": 0.30, "C": 0.60, "D": 0.88}.get(row.credit_rating, 0.35)
+    size_component = {"Enterprise": -0.05, "Mid-Market": 0.00, "SMB": 0.08}.get(row.customer_size, 0.0)
+    industry_component = {
+        "Financial Services": -0.04,
+        "Technology": -0.01,
+        "Healthcare": 0.00,
+        "Manufacturing": 0.03,
+        "Logistics": 0.05,
+        "Retail": 0.07,
+    }.get(row.industry, 0.0)
+    terms_component = max(0, int(row.payment_terms_days) - 30) / 300.0
+    return float(np.clip(credit_component + size_component + industry_component + terms_component, 0.03, 0.97))
+
+
+def build_payments(cfg, invoices, customers, rng):
     valid = invoices.drop_duplicates("invoice_id").dropna(subset=["customer_id"]).copy()
+    valid = valid.merge(
+        customers[["customer_id", "credit_rating", "customer_size", "industry", "payment_terms_days"]],
+        on="customer_id",
+        how="left",
+        validate="many_to_one",
+    )
     cutoff = pd.Timestamp(cfg.end_date).normalize()
     records = []
     payment_counter = 1
@@ -87,14 +118,13 @@ def build_payments(cfg, invoices, rng):
     for row in valid.itertuples(index=False):
         invoice_date = pd.Timestamp(row.invoice_date).normalize()
         due_date = pd.Timestamp(row.due_date).normalize()
-        # Invalid due dates are source defects. Use a temporary operational due date
-        # for simulation; the curated layer later repairs the source field explicitly.
-        effective_due = due_date if due_date >= invoice_date else invoice_date + pd.Timedelta(days=30)
+        effective_due = due_date if due_date >= invoice_date else invoice_date + pd.Timedelta(days=int(row.payment_terms_days))
         days_past_due_at_cutoff = int((cutoff - effective_due).days)
+        risk_score = _customer_payment_risk(row)
 
         outcome = rng.choice(
             ["full", "partial", "over", "unpaid"],
-            p=_payment_outcome_probabilities(days_past_due_at_cutoff),
+            p=_payment_outcome_probabilities(days_past_due_at_cutoff, risk_score),
         )
         if outcome == "unpaid":
             continue
@@ -109,9 +139,9 @@ def build_payments(cfg, invoices, rng):
         elif outcome == "over":
             pieces = [round(total * rng.uniform(1.01, 1.08), 2)]
 
-        # Payment timing centers around the contractual due date. Never create
-        # payments before the invoice date or after the dataset reporting cutoff.
-        base_date = effective_due + pd.to_timedelta(int(rng.normal(4, 18)), unit="D")
+        # Riskier customers tend to pay later, but substantial random noise remains.
+        delay_mean = -3.0 + (risk_score * 38.0)
+        base_date = effective_due + pd.to_timedelta(int(rng.normal(delay_mean, 16)), unit="D")
         base_date = max(base_date, invoice_date)
 
         for j, amount in enumerate(pieces):
@@ -156,13 +186,7 @@ def build_expenses(cfg, rng):
 
 
 def build_budgets(cfg, expenses, rng):
-    """Create department-month budgets around expected monthly spend.
-
-    The first version used arbitrary $120K-$650K budgets, which made every small
-    test month appear under budget. Here we simulate planning error around actual
-    monthly spend so the portfolio contains a realistic mix of favorable and
-    unfavorable variances. This is synthetic calibration, not historical leakage.
-    """
+    """Create department-month budgets around expected monthly spend."""
     months = pd.date_range(pd.Timestamp(cfg.start_date).replace(day=1), pd.Timestamp(cfg.end_date), freq="MS")
     monthly = (
         expenses.assign(month=expenses["expense_date"].dt.to_period("M").dt.to_timestamp())
@@ -176,8 +200,6 @@ def build_budgets(cfg, expenses, rng):
     for month in months:
         for dept in DEPARTMENTS:
             baseline = float(actual_lookup.get((dept, month), dept_typical.get(dept, 50_000.0)))
-            # Roughly 30% of department-months are intentionally planned tightly
-            # enough to end over budget; the remainder retain a modest cushion.
             if rng.random() < 0.30:
                 planning_factor = rng.uniform(0.82, 0.98)
             else:
@@ -222,7 +244,7 @@ def generate_all(cfg):
     rng = np.random.default_rng(cfg.seed)
     customers = build_customers(cfg, rng)
     invoices = build_invoices(cfg, customers, rng)
-    payments = build_payments(cfg, invoices, rng)
+    payments = build_payments(cfg, invoices, customers, rng)
     expenses = build_expenses(cfg, rng)
     budgets = build_budgets(cfg, expenses, rng)
     adjustments = build_adjustments(cfg, invoices, rng)
