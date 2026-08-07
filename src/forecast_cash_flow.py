@@ -79,6 +79,16 @@ FEATURES = [
 ]
 
 
+def _make_model():
+    return GradientBoostingRegressor(
+        n_estimators=250,
+        learning_rate=0.03,
+        max_depth=3,
+        random_state=RANDOM_STATE,
+        loss="huber",
+    )
+
+
 def evaluate_model(series, target, test_weeks=TEST_WEEKS):
     featured = add_time_features(series, target)
     if len(featured) <= test_weeks + 10:
@@ -87,17 +97,11 @@ def evaluate_model(series, target, test_weeks=TEST_WEEKS):
     train = featured.iloc[:-test_weeks].copy()
     test = featured.iloc[-test_weeks:].copy()
 
-    model = GradientBoostingRegressor(
-        n_estimators=250,
-        learning_rate=0.03,
-        max_depth=3,
-        random_state=RANDOM_STATE,
-        loss="huber",
-    )
+    model = _make_model()
     model.fit(train[FEATURES], train[target])
     prediction = model.predict(test[FEATURES])
 
-    # Baseline: use prior 4-week average available at each test observation.
+    # Baseline: prior 4-week average available at each test observation.
     baseline = test["rolling_4"].to_numpy()
     actual = test[target].to_numpy()
 
@@ -114,21 +118,15 @@ def evaluate_model(series, target, test_weeks=TEST_WEEKS):
     return model, train, test, prediction, baseline, metrics(prediction), metrics(baseline)
 
 
-def recursive_forecast(series, target, horizon=FORECAST_HORIZON_WEEKS):
+def _recursive_model_forecast(series, target, horizon=FORECAST_HORIZON_WEEKS):
     history = series[["week", target]].copy().sort_values("week").reset_index(drop=True)
     featured = add_time_features(history, target)
-    model = GradientBoostingRegressor(
-        n_estimators=250,
-        learning_rate=0.03,
-        max_depth=3,
-        random_state=RANDOM_STATE,
-        loss="huber",
-    )
+    model = _make_model()
     model.fit(featured[FEATURES], featured[target])
 
     forecasts = []
     for _ in range(horizon):
-        next_week = history["week"].max() + pd.Timedelta(days=7)
+        next_week = history["week"].max() + pd.offsets.Week(1)
         extended = pd.concat(
             [history, pd.DataFrame({"week": [next_week], target: [np.nan]})],
             ignore_index=True,
@@ -155,16 +153,55 @@ def recursive_forecast(series, target, horizon=FORECAST_HORIZON_WEEKS):
     return pd.DataFrame(forecasts), model
 
 
+def _recursive_baseline_forecast(series, target, horizon=FORECAST_HORIZON_WEEKS):
+    """Forecast recursively with the same 4-week moving-average baseline used in evaluation."""
+    history = series[["week", target]].copy().sort_values("week").reset_index(drop=True)
+    forecasts = []
+    for _ in range(horizon):
+        next_week = history["week"].max() + pd.offsets.Week(1)
+        next_value = float(max(0.0, history[target].tail(4).mean()))
+        history = pd.concat(
+            [history, pd.DataFrame({"week": [next_week], target: [next_value]})],
+            ignore_index=True,
+        )
+        forecasts.append({"week": next_week, f"forecast_{target}": round(next_value, 2)})
+    return pd.DataFrame(forecasts)
+
+
+def recursive_forecast(series, target, method="gradient_boosting", horizon=FORECAST_HORIZON_WEEKS):
+    if method == "gradient_boosting":
+        forecast, _ = _recursive_model_forecast(series, target, horizon)
+        return forecast
+    if method == "rolling_4_baseline":
+        return _recursive_baseline_forecast(series, target, horizon)
+    raise ValueError(f"Unknown forecast method: {method}")
+
+
 def build_forecast_report(weekly):
     results = {}
     forecast_frames = []
 
     for target in ["collections", "expenses"]:
-        _, _, test, prediction, baseline, model_metrics, baseline_metrics = evaluate_model(weekly, target)
-        forecast, _ = recursive_forecast(weekly, target)
+        _, _, test, _, _, model_metrics, baseline_metrics = evaluate_model(weekly, target)
+
+        # Use the simplest method that wins on out-of-sample MAE. A model does not
+        # earn deployment merely by being more complex.
+        if model_metrics["mae"] < baseline_metrics["mae"]:
+            selected_method = "gradient_boosting"
+        else:
+            selected_method = "rolling_4_baseline"
+
+        forecast = recursive_forecast(weekly, target, selected_method)
+        mae_change_pct = (
+            (model_metrics["mae"] - baseline_metrics["mae"]) / baseline_metrics["mae"]
+            if baseline_metrics["mae"]
+            else 0.0
+        )
         results[target] = {
             "model": model_metrics,
             "baseline": baseline_metrics,
+            "selected_method": selected_method,
+            "model_mae_change_vs_baseline": round(float(mae_change_pct), 4),
             "test_start": test["week"].min().strftime("%Y-%m-%d"),
             "test_end": test["week"].max().strftime("%Y-%m-%d"),
         }
@@ -212,6 +249,10 @@ def main():
         print(f"  Baseline RMSE               : ${results[target]['baseline']['rmse']:,.2f}")
         print(f"  Model MAPE                  : {results[target]['model']['mape']:.2%}")
         print(f"  Baseline MAPE               : {results[target]['baseline']['mape']:.2%}")
+        print(f"  Selected method             : {results[target]['selected_method']}")
+        change = results[target]["model_mae_change_vs_baseline"]
+        direction = "worse" if change > 0 else "better"
+        print(f"  Model MAE vs baseline       : {abs(change):.2%} {direction}")
         print()
 
     print("8-week forward outlook")
