@@ -51,3 +51,25 @@ def test_financial_values_are_positive_where_expected():
     assert (data["invoices"]["invoice_amount"] > 0).all()
     assert (data["payments"]["payment_amount"] > 0).all()
     assert (data["expenses"]["amount"] > 0).all()
+    assert (data["budgets"]["budget_amount"] > 0).all()
+
+
+def test_transactions_do_not_extend_past_reporting_cutoff():
+    cfg = small_config()
+    data = generate_all(cfg)
+    cutoff = pd.Timestamp(cfg.end_date)
+    assert pd.to_datetime(data["payments"]["payment_date"]).max() <= cutoff
+    if not data["adjustments"].empty:
+        assert pd.to_datetime(data["adjustments"]["adjustment_date"]).max() <= cutoff
+
+
+def test_budget_generation_has_realistic_variation():
+    data = generate_all(small_config())
+    expenses = data["expenses"].copy()
+    budgets = data["budgets"].copy()
+    expenses["month"] = pd.to_datetime(expenses["expense_date"]).dt.to_period("M").dt.to_timestamp()
+    monthly = expenses.groupby(["department", "month"], as_index=False)["amount"].sum()
+    merged = budgets.merge(monthly, on=["department", "month"], how="left").fillna({"amount": 0})
+    over_budget = merged["amount"] > merged["budget_amount"]
+    assert over_budget.any()
+    assert (~over_budget).any()
