@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 import sys
 
@@ -19,12 +20,13 @@ def sample_inputs():
         base_collections = 100_000 + i * 350 + 10_000 * np.sin(2 * np.pi * i / 52)
         base_expenses = 78_000 + i * 220 + 7_500 * np.cos(2 * np.pi * i / 52)
         for j in range(4):
+            offset = timedelta(days=int(j))
             payment_rows.append({
-                "payment_date": week + pd.Timedelta(days=j),
+                "payment_date": week + offset,
                 "payment_amount": max(1.0, base_collections / 4 + rng.normal(0, 1500)),
             })
             expense_rows.append({
-                "expense_date": week + pd.Timedelta(days=j),
+                "expense_date": week + offset,
                 "amount": max(1.0, base_expenses / 4 + rng.normal(0, 1200)),
             })
 
@@ -48,7 +50,7 @@ def test_time_features_are_lagged_without_nulls():
     assert "rolling_8" in featured.columns
 
 
-def test_forecast_report_returns_eight_weeks():
+def test_forecast_report_returns_eight_weeks_and_selects_method():
     payments, expenses = sample_inputs()
     weekly = build_weekly_series(payments, expenses)
     forecast, results = build_forecast_report(weekly)
@@ -56,3 +58,5 @@ def test_forecast_report_returns_eight_weeks():
     assert (forecast["forecast_collections"] >= 0).all()
     assert (forecast["forecast_expenses"] >= 0).all()
     assert results["forecast_horizon_weeks"] == 8
+    assert results["collections"]["selected_method"] in {"gradient_boosting", "rolling_4_baseline"}
+    assert results["expenses"]["selected_method"] in {"gradient_boosting", "rolling_4_baseline"}
